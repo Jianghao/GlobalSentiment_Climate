@@ -1,0 +1,1495 @@
+---
+title: "Main Regression"
+author: "Jianghao Wang"
+date: "2023/7/15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE)
+knitr::opts_knit$set(root.dir="~/Dropbox/GlobalSentiment/")
+```
+
+```{r set-up}
+# rm(list=ls())
+library(plyr)
+library(rstudioapi)
+library(hash)
+library(lfe)
+library(splines)
+library(data.table)
+library(dplyr)
+library(ggthemes)
+library(modelsummary)
+setwd("~/Dropbox/GlobalSentiment/")
+source("scripts/utils/regression_utils.R")
+source("scripts/utils/theme.R")
+# Sys.setlocale(category = "LC_ALL", locale = "english")
+```
+
+## data preparation
+(1) filter out the country with tweets less than 100 per day;
+(2) filter out the daytime and select the variables needed
+
+```{r}
+## load environment data
+env1 <- get_env_data(level='admin1')
+
+## load the sentiment data
+sent1 <- read.csv('data/sentiment/bert_global_admin1_day_gscc.tsv', sep='\t', stringsAsFactors = F)
+
+## merge two data together and combined with other data sources
+fddf <- get_all_data(sent1, env1)
+
+## selected countries
+daily_posts <- fddf %>%
+  group_by(country) %>%
+  dplyr::summarise(daily_posts_n = sum(post_count) / 365, na.rm = T)
+country_sel <- filter(daily_posts, daily_posts_n > 100)
+excl_countries <- filter(daily_posts, daily_posts_n <= 100)
+fddf <- fddf %>%
+  dplyr::filter(country %in% country_sel$country)
+
+## s.d. the sentiment score by geo_id
+fddf$ind_score_stdz <- ave(fddf$ind_score, fddf$geo_id, FUN=stdz)
+
+## determine the GDP 
+fddf$gdp_hi <- fddf$gdp_per_capita_ppp >  40000 #40000, 13,845
+
+## set the tmax bins
+breaks.tem <- seq(-10 , 40, 5)
+fddf <- fddf %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+fddf <- within(fddf, cuttem <- relevel(cuttem, ref = "(20,25]"))
+
+## export the data
+# write.csv(fddf, "data/analytical_frame.csv", row.names = FALSE)
+```
+
+## reload the processed data
+```{r load, eval=FALSE}
+# fddf <- read_csv("data/analytical_frame.csv")
+
+## sampling the max. temp distribution
+tmax <- dplyr::select(fddf, tmax, ind_count)
+tmax <- data.frame("tem" = rep(tmax$tmax, tmax$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame()
+
+fddf.main <- fddf %>%
+  mutate(pm25_2 = pm25 * pm25, 
+         pr_2 = pr * pr)
+fddf <- filter(fddf.main, population > 0) 
+```
+
+## main regression (no bins)
+
+Temperature's effect on sentiment appears to be inverted U curve.
+
+```{r maim, eval=FALSE}
+reg_tmax_2 <- felm(ind_score_stdz ~ tmax + tmax_2 +
+                     pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id + date, 
+                   data=fddf, 
+                   cmethod = "reghdfe",
+                   na.action="na.omit", 
+                   weights = fddf$population)
+
+dep.variable <- c("Sentiment change")
+fe.list <- list(c("Admin1 FE", "Yes", "Yes", "Yes", "Yes"),
+                c("Data FE", "Yes", "Yes", "Yes", "Yes"))
+variables <- c("Tmax","Tmax²",
+               "PRCP", "PRCP²", "PM25", "PM25²", "T range", "WIND", "CLOUD", "HUMIDITY", "Constant")
+stargazer(reg_tmax_2,
+          model.numbers = TRUE,
+          digits=4, align=TRUE,
+          column.labels = "",
+          dep.var.labels=dep.variable,
+          covariate.labels=variables,
+          add.lines = fe.list,
+          notes = c("Clustered on Admin1 and date"),
+          # df=FALSE, head=TRUE,
+          no.space=TRUE,
+          type="text",
+          star.cutoffs=c(0.01,0.005,0.001), report = "vc*", 
+          column.sep.width = "Opt",
+          title = "Baseline regression: Max. Temperature")
+
+coef <- felmCoeff(felm = reg_tmax_2, var = "all")
+save(coef, tmax, file = "output/results/reg_coef_Rdata/01_tmax_square_main.Rdata", compress = T)
+```
+
+
+## Main regressions: Bins
+``` {r bins}
+# (1) Admin1 + Date; Weighted; clustered
+reg_bin_tem <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+
+coef <- felmCoeff(felm = reg_bin_tem, var = "cuttem", breaks = 5, omit = c(20,25))
+
+write.csv(coef, 'output/results/tem_bin_main.csv', row.names = FALSE)
+save(coef, tmax, file = "output/results/reg_coef_Rdata/01_tem_bin_main.Rdata", compress = T)
+  
+p.tem_bin_main <- binned_plot(main.df = coef, dsty.df = tmax,
+                              ylabel = "Sentiment change (% of SD)",
+                              xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                              theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+                              label = "", quantile.plot = F,
+                              density.theme.color = "#2E9FDF")
+plot(p.tem_bin_main)
+ggsave(filename = paste0("output/figures/01_tem_bin_main.pdf"),
+       plot = p.tem_bin_main, width = 7, height = 5)
+
+
+modelsummary(list(reg_bin_tem), stars = TRUE)
+```
+
+## (distributed) Lag effect
+
+``` {r lag}
+
+## set the tmax bins with lag effect
+fddf_lag <- fddf %>%
+  arrange(geo_id, year, month, day) %>% 
+  mutate(tmax_lag_1 = lag(tmax, 1), 
+         tmax_lag_2 = lag(tmax, 2),
+         tmax_lag_3 = lag(tmax, 3)) %>%
+  mutate(cuttem       =  cut(tmax,       breaks = breaks.tem),
+         cuttem_lag_1 =  cut(tmax_lag_1, breaks = breaks.tem),
+         cuttem_lag_2 =  cut(tmax_lag_2, breaks = breaks.tem),
+         cuttem_lag_3 =  cut(tmax_lag_3, breaks = breaks.tem))
+fddf_lag <- within(fddf_lag, cuttem       <- relevel(cuttem,       ref = "(20,25]"))
+fddf_lag <- within(fddf_lag, cuttem_lag_1 <- relevel(cuttem_lag_1, ref = "(20,25]"))
+fddf_lag <- within(fddf_lag, cuttem_lag_2 <- relevel(cuttem_lag_2, ref = "(20,25]"))
+fddf_lag <- within(fddf_lag, cuttem_lag_3 <- relevel(cuttem_lag_3, ref = "(20,25]"))
+
+## distributed lag 1
+reg_bin_tem_lag_1 <- felm(ind_score_stdz ~ cuttem + cuttem_lag_1 +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf_lag, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf_lag$population)
+coef_lag_1 <- felmCoeff(felm = reg_bin_tem_lag_1, var = "cuttem", breaks = 5, omit = c(20,25))
+coef_lag_1 <- coef_lag_1[c(1:9, 19),]
+
+## Lag 2
+reg_bin_tem_lag_2 <- felm(ind_score_stdz ~ cuttem + cuttem_lag_1 + cuttem_lag_2 +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf_lag, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf_lag$population)
+coef_lag_2 <- felmCoeff(felm = reg_bin_tem_lag_2, var = "cuttem", breaks = 5, omit = c(20,25))
+coef_lag_2 <- coef_lag_2[c(1:9, 28),]
+
+## Lag 3
+reg_bin_tem_lag_3 <- felm(ind_score_stdz ~ cuttem + cuttem_lag_1 + cuttem_lag_2 + cuttem_lag_3 +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf_lag, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf_lag$population)
+coef_lag_3 <- felmCoeff(felm = reg_bin_tem_lag_3, var = "cuttem", breaks = 5, omit = c(20,25))
+coef_lag_3 <- coef_lag_3[c(1:9, 37),]
+
+# p.tem_bin_main_lag <- binned_plot(main.df = coef_lag, dsty.df = tmax,
+#                               ylabel = "Sentiment change (% of SD)",
+#                               xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+#                               theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+#                               label = "Lag 3 day", 
+#                               ylim = c(-48, 10),
+#                               label.position = 3,
+#                               quantile.plot = F,
+#                               density.theme.color = "#2E9FDF")
+# ggsave(filename = paste0("output/figures/01_tem_bin_main_lag_3.pdf"),
+#        plot = p.tem_bin_main_lag, width = 7, height = 5)
+# plot(p.tem_bin_main_lag)
+
+# Combine
+pmain_temp <- ggplot() +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_line(data=coef_lag_1, aes(x = xmid, y = coef * 100, color= "Distributed lag 1 day"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_lag_1, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#00A087") +
+  geom_point(data=coef_lag_1, aes(x = xmid, y = coef * 100),
+             colour = "#00A087", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_lag_2, aes(x = xmid, y = coef * 100, color= "Distributed lag 2 day"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_lag_2,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#E64B35") +
+  geom_point(data=coef_lag_2, aes(x = xmid, y = coef * 100),
+             colour = "#E64B35", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_lag_3, aes(x = xmid, y = coef * 100, color= "Distributed lag 3 day"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_lag_3,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#9632B8") +
+  geom_point(data=coef_lag_3, aes(x = xmid, y = coef * 100),
+             colour = "#9632B8", size = 3, show.legend = FALSE) +
+  geom_line(data=coef, aes(x = xmid, y = coef * 100, color= "No lag"),
+            size=1.5, alpha=1.0) +
+  geom_ribbon(data=coef, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#2E9FDF") +
+  geom_point(data=coef, aes(x = xmid, y = coef * 100),
+             colour = "#2E9FDF", size = 3, show.legend = FALSE) +
+  scale_color_manual(
+    name = "Daily Max. Temperature:", values = c(
+      "No lag" = "#2E9FDF",
+      "Distributed lag 1 day" = "#00A087",
+      "Distributed lag 2 day" = "#E64B35",
+      "Distributed lag 3 day" = "#9632B8"
+    )
+  ) +
+  ylab("Sentiment change (% of SD)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  theme_Publication() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.key.size= unit(0.6, "cm"),
+    legend.position = c(0.58, 0.25),
+    legend.direction = "vertical"
+  )
+
+plot(pmain_temp)
+ggsave(filename = "output/figures/tem_robustness_distribute_lag.pdf",
+       plot = pmain_temp, width = 8, height = 6)
+
+modelsummary::modelsummary(list(reg_bin_tem, reg_bin_tem_lag_1, reg_bin_tem_lag_2, reg_bin_tem_lag_3), stars = TRUE)
+```
+
+## Individual Level
+
+```{r}
+# Read in data
+sent_ind <- read.csv('data/sentiment/bert_global_admin1_day_by_ind_gscc_user_fe.tsv', sep='\t', stringsAsFactors = FALSE)
+
+fddf_ind <- get_all_data(sent_ind, env1)
+
+ind_posts <- fddf_ind %>%
+  group_by(sender_id) %>%
+  dplyr::summarise(ind_posts_n = sum(count), na.rm = F) %>%
+  dplyr::filter(ind_posts_n >= 60 & ind_posts_n < 1000)
+
+# daily_posts <- fddf_ind %>%
+#   group_by(country) %>%
+#   dplyr::summarise(daily_posts_n = sum(count) / 365, na.rm = F)
+# country_sel <- filter(daily_posts, daily_posts_n > 10)
+
+fddf_ind_sel <- fddf_ind %>%
+  # dplyr::filter(country %in% country_sel$country) %>%
+  dplyr::filter(sender_id %in% ind_posts$sender_id)
+  
+
+fddf_ind_sample <- fddf_ind_sel %>%
+    mutate(pm25_2 = pm25 * pm25, 
+         pr_2 = pr * pr)
+# set.seed(123)
+# fddf_ind_sample <- sample_n(fddf_ind_sample, as.integer(nrow(fddf_ind_sample)/10))
+fddf_ind_sample$score_stdz <- ave(fddf_ind_sample$score, fddf_ind_sample$sender_id, FUN=stdz)
+
+breaks.tem <- seq(-10, 40, 5)
+fddf_ind_sample <- fddf_ind_sample %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+fddf_ind_sample <- within(fddf_ind_sample, cuttem <- relevel(cuttem, ref = "(25,30]"))
+
+# Regression
+reg_bin_tem_ind_fe <- felm(score_stdz ~ cuttem +
+                             pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                           | date + sender_id # + country 
+                           | 0
+                           | sender_id, #geo_id + date,
+                           data= fddf_ind_sample, 
+                           exactDOF=TRUE, 
+                           psdef=FALSE,
+                           cmethod = "reghdfe",
+                           weights = fddf_ind_sample$count,
+                           na.action="na.omit")
+
+coef <- felmCoeff(felm = reg_bin_tem_ind_fe, var = "cuttem", breaks = 5, omit = c(25,30))
+
+## sampling the max. temp distribution
+tmax_ind <- dplyr::select(fddf_ind_sample, tmax, count)
+tmax_ind <- data.frame("tem" = rep(tmax_ind$tmax, tmax_ind$count)) %>% as.data.frame()
+
+p.tem_bin_ind_fe <- binned_plot(main.df = coef, dsty.df = tmax_ind,
+                              ylabel = "Sentiment change (%)",
+                              xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                              theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+                              label = "",
+                              ylim = c(-5, 0.5),
+                              density.theme.color = "#2E9FDF")
+
+plot(p.tem_bin_ind_fe)
+ggsave(filename = paste0("output/figures/01_tem_bin_ind_fe.pdf"),
+       plot = p.tem_bin_ind_fe, width = 7, height = 5)
+
+
+modelsummary(reg_bin_tem_ind_fe, stars = T)
+
+```
+
+## anomaly
+```{r}
+
+df <- read.csv("data/anomaly.csv")
+df$id <- factor(df$id, levels = df$id)
+df$semax <- df$coef + df$se
+df$semin <- df$coef - df$se
+
+p.anomaly <- ggplot(df, aes(x = id, y = coef)) +
+  geom_hline(yintercept = 0, color="grey50", linetype = 1) +
+  geom_bar(stat = "identity",
+           fill = "#2E9FDF",
+           width = 0.6,
+           alpha = 0.8) +
+  geom_text(
+    aes(label = star),
+    vjust = 1.2,
+    hjust = -0.2,
+    colour = "black",
+    size = 6
+  ) +
+  ylab("Marginal effect of °C on \nsentiment change") +
+  xlab("Anomaly") +
+  geom_errorbar(aes(ymin = coef - se, ymax = coef + se),
+                colour = "grey25",
+                width = 0.1) +
+  theme_Publication() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, vjust = 0.6)
+  )
+
+plot(p.anomaly)
+
+# ggsave(filename = paste0("output/figures/01_tem_anomaly.pdf"),
+#        plot = p.anomaly, width = 5, height = 5)
+```
+
+## Robustness check
+
+## Week day
+```{r}
+
+fddf$mon <- fddf$DOW==1
+fddf$tue <- fddf$DOW==2
+fddf$wed <- fddf$DOW==3
+fddf$thu <- fddf$DOW==4
+fddf$fri <- fddf$DOW==5
+fddf$sat <- fddf$DOW==6
+fddf$sun <- fddf$DOW==7
+
+fddf$week_day <- fddf$DOW %in% c(1, 2, 3, 4, 5)
+
+reg_bin_tem_week <- felm(ind_score_stdz ~ mon + tue + wed + thu + fri + sat
+                   | geo_id + month
+                   | 0,
+                   data=fddf, na.action="na.omit", weights = fddf$population)
+reg_bin_tem_week
+
+reg_bin_tem_week <- felm(ind_score_stdz ~ week_day
+                   | geo_id + month
+                   | 0,
+                   data=fddf, na.action="na.omit", weights = fddf$ind_count)
+
+coef <- summary(reg_bin_tem_week)$coefficients %>%
+    as.data.frame()
+coef$ci.l <- coef$Estimate - 1.96*coef$`Std. Error`
+coef$ci.h <- coef$Estimate + 1.96*coef$`Std. Error`
+write.csv(coef, 'output/results/weekday_sentiment_results.csv', row.names = FALSE)
+
+modelsummary(reg_bin_tem_week, stars = T)
+```
+
+## Results by Weights
+```{r}
+# (1) Number of User Weights
+reg_bin_tem_w_users <- felm(ind_score_stdz ~ cuttem +
+                              pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                            | geo_id + date
+                            | 0
+                            | geo_id,
+                            data = fddf, 
+                            cmethod = "reghdfe", 
+                            na.action = "na.omit", 
+                            weights = fddf$ind_count)
+coef_w_users <- felmCoeff(felm = reg_bin_tem_w_users, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (2) Number of Posts Weights
+reg_bin_tem_w_posts <-felm(ind_score_stdz ~ cuttem +
+                             pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                           | geo_id + date
+                           | 0
+                           | geo_id,
+                           data = fddf, 
+                           cmethod = "reghdfe", 
+                           na.action = "na.omit", 
+                           weights = fddf$post_count)
+coef_w_posts <- felmCoeff(felm = reg_bin_tem_w_posts, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (3) Population Weights
+reg_bin_tem_w_pop <- reg_bin_tem
+coef_w_pop <- felmCoeff(felm = reg_bin_tem_w_pop, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (4) No Weights
+reg_bin_tem_w_none <- felm(ind_score_stdz ~ cuttem +
+                             pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                           | geo_id + date
+                           | 0
+                           | geo_id,
+                           data = fddf, 
+                           cmethod = "reghdfe", 
+                           na.action = "na.omit")
+coef_w_none <- felmCoeff(felm = reg_bin_tem_w_none, var = "cuttem", breaks = 5, omit = c(20,25))
+
+pmain.weights <- ggplot() +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_line(data=coef_w_posts, aes(x = xmid, y = coef * 100, color= "Weighted by Number of Posts"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_w_posts,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#E64B35") +
+  geom_point(data=coef_w_posts, aes(x = xmid, y = coef * 100),
+             colour = "#E64B35", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_w_none, aes(x = xmid, y = coef * 100, color= "No Weights"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_w_none, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#9632B8") +
+  geom_point(data=coef_w_none, aes(x = xmid, y = coef * 100),
+             colour = "#9632B8", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_w_users, aes(x = xmid, y = coef * 100, color= "Weighted by Number of Users"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_w_users, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#2E9FDF") +
+  geom_point(data=coef_w_users, aes(x = xmid, y = coef * 100),
+             colour = "#2E9FDF", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_w_pop, aes(x = xmid, y = coef * 100, color= "Weighted by Population"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_w_pop, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#00A087") +
+  geom_point(data=coef_w_pop, aes(x = xmid, y = coef * 100),
+             colour = "#00A087", size = 3, show.legend = FALSE) +
+  scale_color_manual(
+    name = "Weighting Scheme:", values = c(
+      "No Weights" = "#9632B8",
+      "Weighted by Number of Users" = "#2E9FDF",
+      "Weighted by Number of Posts" = "#E64B35",
+      "Weighted by Population" = "#00A087"
+    )
+  ) +
+  ylab("Sentiment change (% of an SD)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  xlim(-10,40.5) +
+  theme_Publication() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.key.size= unit(0.6, "cm"),
+    legend.position = c(0.58, 0.25),
+    legend.direction = "vertical"
+  )
+
+xdsty <- axis_canvas(pmain.weights, axis = "x", data=tmax, aes(x=tem)) +
+  geom_histogram(binwidth = 1, alpha=0.5, size=0.5, colour = "grey", fill = NA) +
+  # geom_density(aes(y=1 * ..count..), alpha=0.3, size=0.5, colour = density.theme.color,
+  #              fill = density.theme.fill) +
+  expand_limits(y = - nrow(tmax)/100)
+
+p.mosaic.weights <- insert_xaxis_grob(
+  pmain.weights, xdsty, grid::unit(0.20, "null"), position = "bottom"
+)
+plot(p.mosaic.weights)
+
+ggsave(filename = "output/figures/tem_robust_weights.pdf",
+       plot = p.mosaic.weights, width = 8, height = 6)
+
+ds.list <- list(
+  c("Weights", "Population", "Population", "Population", "Population"),
+  c("Date FE", "Yes", "Yes", "Yes", "Yes"),
+  c("Location FE", "Yes", "Yes", "Yes", "Yes")
+)
+
+
+modelsummary(list(reg_bin_tem_w_users, reg_bin_tem_w_posts, reg_bin_tem_w_pop, reg_bin_tem_w_none), stars = T)
+```
+
+## By year
+
+```{r run year by year}
+# for (i in c(2019)){
+#   print(i)
+#   
+#   temp <- fddf[fddf$year==i,]
+#   
+#   reg_bin_tem <- felm(ind_score_stdz ~ cuttem +
+#                        trange + pm25 + win_s + cldtot + rhu + pr
+#                      | geo_id + year + month + DOW
+#                      | 0,
+#                      data=temp, na.action="na.omit", weights = temp$ind_count)
+#   coef <- felmCoeff(felm = reg_bin_tem, var = "cuttem", breaks = 5, omit = global_omit_bin)
+#   tem <- dplyr::select(temp, tmax, ind_count)
+#   tmax <- data.frame("tem" = rep(tem$tmax, tem$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+#     as.data.frame()
+#   save(coef, tem, file = paste0("output/results/reg_coef_Rdata/01_tem_bin_main_", i, ".Rdata"), compress = T)
+#   
+#   p.tem_bin_main <- binned_plot(main.df = coef, dsty.df = tmax,
+#                                 ylabel = "Sentiment change (%)",
+#                                 xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+#                                 theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+#                                 label = "",
+#                                 density.theme.color = "#2E9FDF")
+#   ggsave(filename = paste0("output/figures/01_tem_bin_main_", i, ".pdf"),
+#          plot = p.tem_bin_main, width = 7, height = 5)
+#   plot(p.tem_bin_main)
+# }
+```
+
+## Change of Fixed effects
+
+``` {r change model setting}
+# (1) No FEs
+reg_bin_tem_no_fes <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | 0
+                   | 0
+                   | geo_id,
+                   data = fddf, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+coef_no_fes <- felmCoeff(felm = reg_bin_tem_no_fes, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (2) Location FEs
+reg_bin_tem_loc_fes <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id
+                   | 0
+                   | geo_id,
+                   data = fddf, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+coef_loc_fes <- felmCoeff(felm = reg_bin_tem_loc_fes, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (3) Location-Year-Month-DOW FEs
+reg_bin_tem_dow_month_fes <- felm(ind_score_stdz ~ cuttem +
+         pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+     | geo_id + year + month + DOW
+     | 0
+     | geo_id,
+     data = fddf, 
+     cmethod = "reghdfe", 
+     na.action = "na.omit", 
+     weights = fddf$population)
+coef_dow_month_fes <- felmCoeff(felm = reg_bin_tem_dow_month_fes, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (4) Location FEs + Date FE
+reg_bin_tem_date_fes <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+coef_date_fes <- felmCoeff(felm = reg_bin_tem_date_fes, var = "cuttem", breaks = 5, omit = c(20,25))
+
+pmain.weights <- ggplot() +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_line(data=coef_no_fes, aes(x = xmid, y = coef * 100, color= "No FEs"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_no_fes, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#9632B8") +
+  geom_point(data=coef_no_fes, aes(x = xmid, y = coef * 100),
+             colour = "#9632B8", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_loc_fes, aes(x = xmid, y = coef * 100, color= "Location FEs"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_loc_fes,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#E64B35") +
+  geom_point(data=coef_loc_fes, aes(x = xmid, y = coef * 100),
+             colour = "#E64B35", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_dow_month_fes, aes(x = xmid, y = coef * 100, color= "Location-Year-Month-DOW FEs"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_dow_month_fes, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#2E9FDF") +
+  geom_point(data=coef_dow_month_fes, aes(x = xmid, y = coef * 100),
+             colour = "#2E9FDF", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_date_fes, aes(x = xmid, y = coef * 100, color= "Location-Date FEs"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_date_fes, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#00A087") +
+  geom_point(data=coef_date_fes, aes(x = xmid, y = coef * 100),
+             colour = "#00A087", size = 3, show.legend = FALSE) +
+  scale_color_manual(
+    name = "Fixed Effects:", values = c(
+      "No FEs" = "#9632B8",
+      "Location FEs" = "#E64B35",
+      "Location-Date FEs" = "#00A087",
+      "Location-Year-Month-DOW FEs" = "#2E9FDF"
+    )
+  ) +
+  ylab("Sentiment change (% of an SD)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  xlim(-10,40.5) +
+  theme_Publication() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.key.size= unit(0.6, "cm"),
+    legend.position = c(0.58, 0.25),
+    legend.direction = "vertical"
+  )
+
+xdsty <- axis_canvas(pmain.weights, axis = "x", data=tmax, aes(x=tem)) +
+  geom_histogram(binwidth = 1, alpha=0.5, size=0.5, colour = "grey", fill = NA) +
+  # geom_density(aes(y=1 * ..count..), alpha=0.3, size=0.5, colour = density.theme.color,
+  #              fill = density.theme.fill) +
+  expand_limits(y = - nrow(tmax)/100)
+
+p.mosaic.weights <- insert_xaxis_grob(
+  pmain.weights, xdsty, grid::unit(0.20, "null"), position = "bottom"
+)
+plot(p.mosaic.weights)
+ggsave(filename = "output/figures/tem_robust_fes.pdf",
+       plot = p.mosaic.weights, width = 8, height = 6)
+
+modelsummary(list(reg_bin_tem_no_fes, reg_bin_tem_loc_fes, reg_bin_tem_dow_month_fes, reg_bin_tem_date_fes), stars = TRUE)
+```
+
+## Robustness by Temperature Measure (Mean, Minimum)
+
+```{r}
+fddf_temp <- fddf
+
+# T max
+breaks.tem <- seq(-10 , 40, 5)
+fddf_temp <- fddf_temp %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+fddf_temp <- within(fddf_temp, cuttem <- relevel(cuttem, ref = "(20,25]"))
+reg_bin_tem_tmax <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf_temp, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf_temp$population)
+coef_tmax <- felmCoeff(felm = reg_bin_tem_tmax, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# T min
+breaks.tem <- seq(-20 , 30, 5)
+fddf_temp <- fddf_temp %>%
+  mutate(cuttem =  cut(tmin, breaks = breaks.tem))
+fddf_temp <- within(fddf_temp, cuttem <- relevel(cuttem, ref = "(20,25]"))
+reg_bin_tem_tmin <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf_temp, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf_temp$population)
+coef_tmin <- felmCoeff(felm = reg_bin_tem_tmin, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# Tem
+breaks.tem <- seq(-15 , 35, 5)
+fddf_temp <- fddf_temp %>%
+  mutate(cuttem =  cut(tem, breaks = breaks.tem))
+fddf_temp <- within(fddf_temp, cuttem <- relevel(cuttem, ref = "(20,25]"))
+reg_bin_tem_tem <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf_temp, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf_temp$population)
+coef_tem <- felmCoeff(felm = reg_bin_tem_tem, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# Combine
+pmain_temp <- ggplot() +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_line(data=coef_tmax, aes(x = xmid, y = coef * 100, color= "Max. T"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_tmax, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#00A087") +
+  geom_point(data=coef_tmax, aes(x = xmid, y = coef * 100),
+             colour = "#00A087", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_tmin, aes(x = xmid, y = coef * 100, color= "Min. T"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_tmin, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#2E9FDF") +
+  geom_point(data=coef_tmin, aes(x = xmid, y = coef * 100),
+             colour = "#2E9FDF", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_tem, aes(x = xmid, y = coef * 100, color= "Mean T"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_tem,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.10, fill = "#E64B35") +
+  geom_point(data=coef_tem, aes(x = xmid, y = coef * 100),
+             colour = "#E64B35", size = 3, show.legend = FALSE) +
+  scale_color_manual(
+    name = "Daily Temperature:", values = c(
+      "Max. T" = "#00A087",
+      "Min. T" = "#2E9FDF",
+      "Mean T" = "#E64B35"
+    )
+  ) +
+  ylab("Sentiment change (% of SD)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  # xlim(-10,40.5) +
+  theme_Publication() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    legend.key.size= unit(0.6, "cm"),
+    legend.position = c(0.58, 0.25),
+    legend.direction = "vertical"
+  )
+
+plot(pmain_temp)
+ggsave(filename = "output/figures/tem_robustness_tem.pdf",
+       plot = pmain_temp, width = 8, height = 6)
+
+modelsummary(list(reg_bin_tem_tmin, reg_bin_tem_tem, reg_bin_tem_tmax), stars = TRUE)
+```
+
+
+## Nonparameter fitting
+
+```{r}
+xx=-10:40
+
+coef.main <- felmCoeff(felm = reg_bin_tem, var = "cuttem", breaks = 5, omit = c(20,25))
+
+# (1) Country + Date; Weighted; spline, 3 knots
+mod1_model <- lm(as.numeric(coef) ~  ns(xmid, df = 3), coef.main)
+yy <- data.frame(xx, knots_3 = sapply(xx, function(x) predict(mod1_model, data.frame(xmid=x))))
+
+# (2) Country + Date; Weighted; spline, 5 knots
+mod2_model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef.main)
+yy <- data.frame(yy, knots_5 = sapply(xx, function(x) predict(mod2_model, data.frame(xmid=x))))
+
+# (3) Country + Date; Weighted; spline, 7 knots
+mod3_model <- lm(as.numeric(coef) ~  ns(xmid, df = 7), coef.main)
+yy <- data.frame(yy, knots_7 = sapply(xx, function(x) predict(mod3_model, data.frame(xmid=x))))
+
+# (4) Country + Date; Weighted; polynomial
+reg_poly2 <- felm(ind_score_stdz ~ poly(tmax, 2, raw=T) +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+mod4 <- coef(reg_poly2)[1:2]
+yy = data.frame(yy, poly2 = sapply(as.numeric(t(as.matrix(mod4)) %*% t(matrix(nrow = length(xx), ncol=2, data = poly(xx, 2, raw=T)))), function(x) x))
+
+# (5) Country + Date; Weighted; cubic polynomial
+reg_poly3 <- felm(ind_score_stdz ~ poly(tmax, 3, raw=T) +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = fddf, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+mod5 <- coef(reg_poly3)[1:3]
+yy = data.frame(yy, poly3 = sapply(as.numeric(t(as.matrix(mod5)) %*% t(matrix(nrow = length(xx), ncol=3, data = poly(xx, 3, raw=T)))), function(x) x))
+
+# # (6) Country + Date; Weighted; 2 bins
+# breaks.tem <- seq(-10 , 40, 2)
+# dta <- fddf %>%
+#   mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+# dta <- within(dta, cuttem <- relevel(cuttem, ref = "(24,26]"))
+# reg_bin_tem <- felm(ind_score ~ cuttem +
+#                       pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+#                    | geo_id + date
+#                    | 0
+#                    | geo_id,
+#                    data = dta, 
+#                    cmethod = "reghdfe", 
+#                    na.action = "na.omit", 
+#                    weights = dta$population)
+# coef <- felmCoeff(felm = reg_bin_tem, var = "cuttem", breaks = 2, omit = c(24, 26))
+# mod6_model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef)
+# yy <- data.frame(yy, bins_2 = sapply(xx, function(x) predict(mod6_model, data.frame(xmid=x))))
+# 
+# p.tem_2bin_main <- binned_plot(main.df = coef, dsty.df = tmax,
+#                               ylabel = "Sentiment change (% of SD)",
+#                               xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+#                               theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+#                               label = "", quantile.plot = F,
+#                               density.theme.color = "#2E9FDF")
+# plot(p.tem_2bin_main)
+# ggsave(filename = paste0("output/figures/01_tem_bin_main_2bin.pdf"),
+#        plot = p.tem_bin_main, width = 7, height = 5)
+# 
+# modelsummary(list(reg_bin_tem), stars = TRUE)
+# 
+# # (7) Country + Date; Weighted; 3 bins
+# breaks.tem <- seq(-10 , 40, 3)
+# dta <- fddf %>%
+#   mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+# dta <- within(dta, cuttem <- relevel(cuttem, ref = "(23,26]"))
+# reg_bin_tem <- felm(ind_score ~ cuttem +
+#                       pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+#                    | geo_id + date
+#                    | 0
+#                    | geo_id,
+#                    data = dta, 
+#                    cmethod = "reghdfe", 
+#                    na.action = "na.omit", 
+#                    weights = dta$population)
+# coef <- felmCoeff(felm = reg_bin_tem, var = "cuttem", breaks = 3, omit = c(23, 26))
+# mod7_model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef)
+# yy <- data.frame(yy, bins_3 = sapply(xx, function(x) predict(mod7_model, data.frame(xmid=x))))
+# 
+# p.tem_3bin_main <- binned_plot(main.df = coef, dsty.df = tmax,
+#                               ylabel = "Sentiment change (% of SD)",
+#                               xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+#                               theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+#                               label = "", quantile.plot = F,
+#                               density.theme.color = "#2E9FDF")
+# plot(p.tem_3bin_main)
+
+# (8) Country + Date; Weighted; 5 bins
+breaks.tem <- seq(-10 , 40, 5)
+dta <- fddf %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta <- within(dta, cuttem <- relevel(cuttem, ref = "(20,25]"))
+reg_bin_tem <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = dta, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = fddf$population)
+coef_8 <- felmCoeff(felm = reg_bin_tem, var = "cuttem", breaks = 5, omit = c(20, 25))
+mod8_model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef_8)
+yy <- data.frame(yy, bins_5 = sapply(xx, function(x) predict(mod8_model, data.frame(xmid=x))))
+
+p.tem_5bin_main <- binned_plot(main.df = coef_8, dsty.df = tmax,
+                              ylabel = "Sentiment change (% of SD)",
+                              xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                              theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+                              label = "", quantile.plot = F,
+                              density.theme.color = "#2E9FDF")
+plot(p.tem_5bin_main)
+```
+
+
+
+## Plot the robustness figures
+
+```{r robustness plots}
+nn <- dim(yy)[2]
+yyr <- yy
+for (i in 2:nn) {
+    yyr[,i] <- (yy[,i] - yy[yy$xx==17,i])*100
+}
+colors<-c(NA,NA,"#9632B8","#E64B35","#FF7F0E","#00A087")
+theme.color<-"grey"
+density.theme.color = "#2E9FDF"
+density.theme.fill = "#2E9FDF"
+density.theme.position = "bottom"
+density.theme.high = 0.15
+
+# format coef
+main.df <- coef.main %>%
+  mutate(star = as.character(star)) %>%
+  mutate(star = ifelse(is.na(star), "", star)) %>%
+  mutate(star_f = ifelse(nchar(star) > 0, "sig", "ns")) %>%
+  mutate(star_f = factor(star_f, levels =  c("sig", "ns")))
+
+# ------------------------------------
+# Splines knots
+# ------------------------------------
+pmain.splines <- ggplot(main.df, aes(x = xmid, y = coef*100)) +
+  geom_line(size = 1.0, colour = "grey25") +
+  geom_ribbon(aes(ymin = ci.l*100, ymax = ci.h*100), alpha = 0.50, fill = theme.color) +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_point(aes(fill = star_f), colour = "grey50", size = 3, show.legend = FALSE) +
+  geom_line(data=yyr, aes(x=xx,y=knots_7),color="#2E9FDF",size=0.8,alpha=0.8)+
+  geom_line(data=yyr, aes(x=xx,y=knots_5),color="#9632B8",size=0.8,alpha=0.8)+
+  geom_line(data=yyr, aes(x=xx,y=knots_3),color="#E64B35",size=0.8,alpha=0.8)+
+  geom_line(data=yyr, aes(x=xx,y=poly3),  color="#00A087",size=0.8,alpha=0.8)+
+  annotate("text", x = 40, y = yyr[xx==40, "knots_7"], vjust = 0, hjust = -0.05,
+           colour = "#2E9FDF", size = 4, label ="(1) Spline (7 knots)")+
+  annotate("text", x = 40, y = yyr[xx==40, "knots_5"], vjust = 0, hjust = -0.05,
+           colour = "#9632B8", size = 4, label ="(2) Spline (5 knots)")+
+  annotate("text", x = 40, y = yyr[xx==40, "knots_3"]-1, vjust = 0, hjust = -0.05,
+           colour = "#E64B35", size = 4, label ="(3) Spline (3 knots)")+
+  annotate("text", x = 40, y = yyr[xx==40, "poly3"], vjust = 0, hjust = -0.05,
+           colour = "#00A087", size = 3.5, label ="(4) Cubic polynomial")+
+  xlim(-10,50) +
+  ylab("Sentiment change (%)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  theme_Publication()+
+  scale_fill_manual(values = c(theme.color, "#FFFFFF"))
+
+# ------------------------------------
+# bins main plot
+# ------------------------------------
+pmain.bins <- ggplot(main.df, aes(x = xmid, y = coef*100)) +
+  geom_line(size = 1.0, colour = "grey25") +
+  geom_ribbon(aes(ymin = ci.l*100, ymax = ci.h*100), alpha = 0.50, fill = theme.color) +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_point(aes(fill = star_f), colour = "grey50", size = 3, show.legend = FALSE) +
+  geom_line(data=yyr, aes(x=xx,y=bins_5),color="#2E9FDF",size=0.8,alpha=0.8)+
+  geom_line(data=yyr, aes(x=xx,y=bins_3),color="#9632B8",size=0.8,alpha=0.8)+
+  geom_line(data=yyr, aes(x=xx,y=bins_2),color="#E64B35",size=0.8,alpha=0.8)+
+  annotate("text", x = 40, y = yyr[xx==40, "bins_5"], vjust = 0, hjust = -0.05,
+           colour = "#2E9FDF", size = 4, label ="(1) Bins 5°C")+
+  annotate("text", x = 40, y = yyr[xx==40, "bins_3"]-1, vjust = 0, hjust = -0.05,
+           colour = "#9632B8", size = 4, label ="(2) Bins 3°C")+
+  annotate("text", x = 40, y = yyr[xx==40, "bins_2"], vjust = 0, hjust = -0.05,
+           colour = "#E64B35", size = 4, label ="(3) Bins 2°C")+
+  xlim(-10,45) +
+  ylab("Sentiment change (%)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  theme_Publication()+
+  scale_fill_manual(values = c(theme.color, "#FFFFFF"))
+
+# ------------------------------------
+# density plot
+# ------------------------------------
+xdsty <- axis_canvas(pmain.splines, axis = "x", data=tmax, aes(x=tem)) +
+  geom_histogram(binwidth = 1, alpha=0.5, size=0.5, colour = "grey", fill = NA) +
+  # geom_density(aes(y=1 * ..count..), alpha=0.3, size=0.5, colour = density.theme.color,
+  #              fill = density.theme.fill) +
+  expand_limits(y = - nrow(tem)/100)
+
+# mosaic two parts
+p.mosaic.splines <- insert_xaxis_grob(pmain.splines, xdsty, grid::unit(density.theme.high, "null"),
+                                      position = density.theme.position)
+plot(p.mosaic.splines)
+ggsave(filename = paste0("output/figures/02_tem_robust_splines.pdf"),
+       plot = p.mosaic.splines, width = 8, height = 5)
+
+# p.mosaic.bins <- insert_xaxis_grob(pmain.bins, xdsty, grid::unit(density.theme.high, "null"),
+#                                    position = density.theme.position)
+# plot(p.mosaic.bins)
+# ggsave(filename = paste0("scripts/jianghao/figures/02_tem_robust_bins.pdf"),
+#        plot = p.mosaic.bins, width = 8, height = 5)
+
+
+```
+
+
+## Results by Climate Zone
+
+```{r climate zone}
+## zone E: Polar
+dta.cz <- filter(fddf, cz1 == "E")
+breaks.tem <- seq(-10, 25, 5)
+dta.cz <- dta.cz %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta.cz <- within(dta.cz, cuttem <- relevel(cuttem, ref = "(15,20]"))
+reg.cz.e <- felm(ind_score_stdz ~ cuttem +
+                   pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                 | geo_id + date
+                 | 0,
+                 | geo_id,
+                 data= dta.cz,
+                 cmethod = "reghdfe",
+                 na.action = "na.omit", 
+                 weights = dta.cz$ind_count)
+coef.e <- felmCoeff(felm = reg.cz.e, var = "cuttem", breaks = 5, omit = c(15,20))
+
+xx <- -10:20
+model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef.e)
+yy.e <- data.frame(xx, predict(model, data.frame(xmid=xx), interval = "confidence"))
+tem <- dplyr::select(dta.cz, tmax, ind_count)
+tmax.e <- data.frame("tem" = rep(tem$tmax, tem$ind_count)) %>%
+  as.data.frame() %>%
+  mutate(group = "Polar")
+
+e.cz <- binned_plot(main.df = coef.e, dsty.df = tmax.e,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+                    label = "Polar",
+                    xlim = c(-10, 40),
+                    ylim = c(-50, 7),
+                    label.position = 3,
+                    density.theme.color = "#2E9FDF")
+plot(e.cz)
+ggsave(filename = paste0("output/figures/03_tem_climate_zone_E_polar.png"),
+       plot = e.cz, width = 7, height = 5)
+
+## zone D: Snow
+dta.cz <- filter(fddf, cz1 == "D")
+breaks.tem <- seq(-10, 30, 5)
+dta.cz <- dta.cz %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta.cz <- within(dta.cz, cuttem <- relevel(cuttem, ref = "(20,25]"))
+reg.cz.d <- felm(ind_score_stdz ~ cuttem +
+                   pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                 | geo_id + date
+                 | 0,
+                 | geo_id,
+                 data= dta.cz,
+                 # cmethod = "reghdfe",
+                 na.action = "na.omit", 
+                 weights = dta.cz$population)
+coef.d <- felmCoeff(felm = reg.cz.d, var = "cuttem", breaks = 5, omit = c(20,25))
+xx <- -10:35
+model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef.d)
+yy.d <- data.frame(xx, predict(model, data.frame(xmid=xx), interval = "confidence"))
+tem <- dplyr::select(dta.cz, tmax, ind_count)
+tmax.d <- data.frame("tem" = rep(tem$tmax, tem$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame() %>%
+  mutate(group = "Snow")
+d.cz <- binned_plot(main.df = coef.d, dsty.df = tmax.d,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#9632B8", density.theme.fill = "#9632B8",
+                    xlim = c(-10, 40),
+                    ylim = c(-50, 7),
+                    label = "Snow",
+                    label.position = 3,
+                    density.theme.color = "#9632B8")
+plot(d.cz)
+ggsave(filename = paste0("output/figures/03_tem_climate_zone_D_snow.png"),
+       plot = d.cz, width = 7, height = 5)
+
+## zone B: Arid
+dta.cz <- filter(fddf, cz1 == "B")
+breaks.tem <- seq(0, 40, 5)
+dta.cz <- dta.cz %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta.cz <- within(dta.cz, cuttem <- relevel(cuttem, ref = "(25,30]"))
+reg.cz.b <- felm(ind_score_stdz ~ cuttem +
+                   pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                 | geo_id + date
+                 | 0
+                 | geo_id,
+                 data= dta.cz,
+                 cmethod = "reghdfe",
+                 na.action = "na.omit", 
+                 weights = dta.cz$population)
+coef.b <- felmCoeff(felm = reg.cz.b, var = "cuttem", breaks = 5, omit = c(25,30))
+xx <- -5:50
+model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef.b)
+yy.b <- data.frame(xx, predict(model, data.frame(xmid=xx), interval = "confidence"))
+tem <- dplyr::select(dta.cz, tmax, ind_count)
+tmax.b <- data.frame("tem" = rep(tem$tmax, tem$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame() %>%
+  mutate(group = "Arid")
+b.cz <- binned_plot(main.df = coef.b, dsty.df = tmax.b,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#E64B35", density.theme.fill = "#E64B35",
+                    xlim = c(-10, 40),
+                    ylim = c(-50, 7),
+                    label = "Arid",
+                    label.position = 3,
+                    density.theme.color = "#E64B35")
+ggsave(filename = paste0("output/figures/03_tem_climate_zone_B_arid.png"),
+       plot = b.cz, width = 7, height = 5)
+
+## zone C: Warm
+dta.cz <- filter(fddf, cz1 == "C")
+breaks.tem <- seq(-5, 40, 5)
+dta.cz <- dta.cz %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta.cz <- within(dta.cz, cuttem <- relevel(cuttem, ref = "(15,20]"))
+reg.cz.c <- felm(ind_score_stdz ~ cuttem +
+                   pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                 | geo_id + date
+                 | 0
+                 | geo_id,
+                 data= dta.cz,
+                 cmethod = "reghdfe",
+                 na.action = "na.omit", 
+                 weights = dta.cz$ind_count)
+coef.c <- felmCoeff(felm = reg.cz.c, var = "cuttem", breaks = 5, omit = c(15,20))
+xx <- -10:40
+model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef.c)
+yy.c <- data.frame(xx, predict(model, data.frame(xmid=xx), interval = "confidence"))
+tem <- dplyr::select(dta.cz, tmax, ind_count)
+tmax.c <- data.frame("tem" = rep(tem$tmax, tem$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame() %>%
+  mutate(group = "Warm")
+c.cz <- binned_plot(main.df = coef.c, dsty.df = tmax.c,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#00A087", density.theme.fill = "#00A087",
+                    xlim = c(-10, 40),
+                    ylim = c(-50, 7),
+                    label = "Warm",
+                    label.position = 3,
+                    density.theme.color = "#00A087")
+ggsave(filename = paste0("output/figures/03_tem_climate_zone_C_warm.png"),
+       plot = c.cz, width = 7, height = 5)
+
+
+## zone A: Equatorial
+dta.cz <- filter(fddf, cz1 == "A")
+breaks.tem <- seq(15, 40, 5)
+dta.cz <- dta.cz %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta.cz <- within(dta.cz, cuttem <- relevel(cuttem, ref = "(25,30]"))
+reg.cz.a <- felm(ind_score_stdz ~ cuttem +
+                   pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                 | geo_id + date
+                 | 0
+                 | geo_id,
+                 data= dta.cz,
+                 cmethod = "reghdfe",
+                 na.action = "na.omit", 
+                 weights = dta.cz$population)
+coef.a <- felmCoeff(felm = reg.cz.a, var = "cuttem", breaks = 5, omit = c(25, 30))
+xx <- 21:38
+model <- lm(as.numeric(coef) ~  ns(xmid, df = 5), coef.a)
+yy.a <- data.frame(xx, predict(model, data.frame(xmid=xx), interval = "confidence"))
+tem <- dplyr::select(dta.cz, tmax, ind_count)
+tmax.a <- data.frame("tem" = rep(tem$tmax, tem$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame() %>%
+  mutate(group = "Equatorial")
+a.cz <- binned_plot(main.df = coef.a, dsty.df = tmax.a,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#A65628", density.theme.fill = "#A65628",
+                    xlim = c(-10, 40),
+                    ylim = c(-50, 7),
+                    label = "Equatorial",
+                    label.position = 3,
+                    density.theme.color = "#A65628")
+ggsave(filename = "output/figures/03_tem_climate_zone_A_equatorial.png",
+       plot = a.cz, width = 7, height = 5)
+
+# # ------------------------------------
+# # Climate zone mapping
+# # ------------------------------------
+cz.sp <- sf::st_read("data/spatial/adm1_simplify.shp") %>%
+  left_join(cz, by = c("OBJECTID" = "geo_id"))
+
+theme_geosf <- function() {
+  theme_bw() +
+    theme(
+      panel.border = element_blank(),
+      # plot.background = element_rect(fill = "#D7E8F466"),
+      panel.grid.major = element_line(colour = "grey95", size = 0.2),
+      legend.position = "bottom",
+      legend.key = element_rect(fill = 'transparent', color = 'transparent'),
+      legend.key.height = unit(0.06, "npc"),
+      legend.key.width = unit(0.07, "npc"),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      legend.margin = margin(t = 3, b = 3, r = 6, l = 6),
+      legend.background = element_rect(color = "transparent", fill = "transparent"),
+      legend.box.background = element_rect(fill = 'transparent', color = 'transparent'),
+      legend.direction = 'horizontal',
+      axis.title = element_text(size = 0.1, color = 'white'),
+      axis.text = element_text(size = 0.1, color = 'white'),
+      axis.ticks = element_line(size = 0.1, color = 'white')
+      )
+}
+
+cz.map <- ggplot() +
+  geom_sf(data = cz.sp, aes(fill = factor(cz1)), color="grey80", lwd = 0.075, alpha=1) +
+    scale_fill_manual(values = c("#A65628", "#E64B35", "#00A087","#9632B8", "#2E9FDF","white"),
+                      labels = c("Equatorial", "Arid", "Warm","Snow", "Polar", "Ocean"),
+                      name= "Climate Zone")+
+  theme_geosf()
+
+ggsave("output/figures/03_tem_climate_zone_map.pdf", cz.map,
+       width = 8, height = 5, dpi = 600)
+
+# ------------------------
+# cowplot a.cz, b.cz, c.cz, d.cz, e.cz, cz.map
+# ------------------------
+library(cowplot)
+p.mosaic <- plot_grid(a.cz, b.cz, c.cz, d.cz, e.cz, ncol = 2, nrow=3,
+                    align="hv", labels = c("a", "b", "c", "d", "e"))
+save_plot("output/figures/03_tem_climate_zone_mosaic.png", p.mosaic,
+          base_width = 10, base_height = 12)
+
+p.mosaic <- plot_grid(a.cz, b.cz, c.cz, d.cz, ncol = 2, nrow=2,
+                    align="hv", labels = c("a", "b", "c", "d"))
+save_plot("output/figures/03_tem_climate_zone_mosaic_without_polar.pdf", p.mosaic,
+          base_width = 10, base_height = 8)
+
+
+# ------------------------------------
+# Climate zone plots
+# ------------------------------------
+p.cz.one <- ggplot() +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_line(data=yy.e, aes(x=xx,y=fit),color="#2E9FDF",size=1,alpha=1)+
+  geom_line(data=yy.d, aes(x=xx,y=fit),color="#9632B8",size=1,alpha=1)+
+  geom_line(data=yy.b, aes(x=xx,y=fit),color="#E64B35",size=1,alpha=1)+
+  geom_line(data=yy.c, aes(x=xx,y=fit),color="#00A087",size=1,alpha=1)+
+  geom_line(data=yy.a, aes(x=xx,y=fit),color="#A65628",size=1,alpha=1)+
+  xlim(-10,50) +
+  ylab("Sentiment change (%)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  theme_Publication()+
+  scale_fill_manual(values = c(theme.color, "#FFFFFF"))
+
+# ----- ridge plot -----
+library(ggridges)
+tem.bind <- rbind(tmax.a, tmax.b, tmax.c, tmax.d, tmax.e)
+mypal <- c("#A65628", "#E64B35", "#00A087","#9632B8", "#2E9FDF")
+xridge <- axis_canvas(p.cz.one, axis = "x", data = tem.bind,
+                      aes(x = tem, y = as.numeric(factor(group)), colour = group, fill = group)) +
+  # geom_density_ridges(alpha=0.2, size=0.5, scale = 1.5, bandwidth = 1) +
+  geom_density_ridges(alpha=0.2, size=0.5, scale = 1.5, bins = 60, stat="binline") +
+  scale_colour_manual(values = mypal) +
+  scale_fill_manual(values = mypal)
+p.cz.one.xridge<- insert_xaxis_grob(p.cz.one, xridge, grid::unit(0.8, "null"), position = "bottom")
+plot(p.cz.one.xridge)
+ggsave("output/figures/03_tem_climate_zone_fits_xridge.pdf", p.cz.one.xridge,
+       width = 7, height = 8)
+```
+
+
+## Results by Income Level
+
+```{r}
+## High Income:
+dta_h <- filter(fddf, income_2019 == 'H')
+breaks.tem <- seq(-10, 40, 5)
+dta_h <- dta_h %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta_h <- within(dta_h, cuttem <- relevel(cuttem, ref = "(20,25]"))
+
+reg_bin_tem_h <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0,
+                   # | geo_id,
+                   data = dta_h, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = dta_h$population)
+coef_h <- felmCoeff(felm = reg_bin_tem_h, var = "cuttem", breaks = 5, omit = c(20,25))
+tmax_h <- dplyr::select(dta_h, tmax, ind_count)
+tmax_h <- data.frame("tem" = rep(tmax_h$tmax, tmax_h$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame()
+plot_h <- binned_plot(main.df = coef_h, dsty.df = tmax_h,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+                    label = "High Income",
+                    # xlim = c(-10, 40),
+                    # ylim = c(-50, 15),
+                    label.position = 3,
+                    density.theme.color = "#2E9FDF")
+plot(plot_h)
+ggsave(filename = paste0("output/figures/04_tem_income_h.pdf"),
+       plot = plot_h, width = 7, height = 5)
+
+
+## Lower and Middle Income:
+dta_l <- filter(fddf, income_2019 %in% c('L', 'H'))
+# dta_l <- filter(dta_l, population > 0 & gdp_per_capita_ppp < 15000)
+breaks.tem <- seq(-10, 40, 5)
+dta_l <- dta_l %>%
+  mutate(cuttem =  cut(tmax, breaks = breaks.tem))
+dta_l <- within(dta_l, cuttem <- relevel(cuttem, ref = "(20,25]"))
+
+reg_bin_tem_l <- felm(ind_score_stdz ~ cuttem +
+                      pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+                   | geo_id + date
+                   | 0
+                   | geo_id,
+                   data = dta_l, 
+                   cmethod = "reghdfe", 
+                   na.action = "na.omit", 
+                   weights = dta_l$population)
+coef_l <- felmCoeff(felm = reg_bin_tem_l, var = "cuttem", breaks = 5, omit = c(20,25))
+tmax_l <- dplyr::select(dta_l, tmax, ind_count)
+tmax_l <- data.frame("tem" = rep(tmax_l$tmax, tmax_l$ind_count) %>% sample(1e6, replace = FALSE)) %>%
+  as.data.frame()
+plot_l <- binned_plot(main.df = coef_l, dsty.df = tmax_l,
+                    ylabel = "Sentiment change (%)",
+                    xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+                    theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+                    label = "Low and Middle Income",
+                    # xlim = c(-10, 40),
+                    # ylim = c(-50, 15),
+                    label.position = 3,
+                    density.theme.color = "#2E9FDF")
+plot(plot_l)
+ggsave(filename = paste0("output/figures/04_tem_income_l.pdf"),
+       plot = plot_l, width = 7, height = 5)
+
+# ------------------------
+# plot
+# ------------------------
+pmain_income <- ggplot() +
+  geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+  geom_line(data=coef_h, aes(x = xmid, y = coef * 100, color= "High income country"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_h, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.25, fill = "#00A087") +
+  geom_point(data=coef_h, aes(x = xmid, y = coef * 100),
+             colour = "#00A087", size = 3, show.legend = FALSE) +
+  geom_line(data=coef_l, aes(x = xmid, y = coef * 100, color= "Low and middle-income country"),
+            size=1.0, alpha=1.0) +
+  geom_ribbon(data=coef_l,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+              alpha = 0.25, fill = "#E64B35") +
+  geom_point(data=coef_l, aes(x = xmid, y = coef * 100),
+             colour = "#E64B35", size = 3, show.legend = FALSE) +
+  scale_color_manual(
+    name = "Income per capita", values = c(
+      "High income country" = "#00A087",
+      "Low and middle-income country" = "#E64B35"
+    )
+  ) +
+  ylab("Sentiment change (% of an SD)") +
+  xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+  xlim(-5,40.5) +
+  theme_Publication() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.key.size= unit(0.6, "cm"),
+    legend.position = c(0.58, 0.15),
+    legend.direction = "vertical"
+  )
+
+plot(pmain_income)
+ggsave(filename = "output/figures/04_tem_income_hetero.pdf",
+       plot = pmain_income, width = 8, height = 6)
+```
+
+## Results by GDP Level
+
+```{r}
+# ## High GDP:
+# ## determine the GDP 
+# fddf.main$gdp_hi <- fddf.main$gdp_per_capita_ppp >  13845 #40000, 13,845
+# 
+# dta_gdp <- filter(fddf.main, gdp_hi == TRUE)
+# reg_bin_tem_gdp_h <- felm(ind_score_stdz ~ cuttem +
+#                       pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+#                    | geo_id + date
+#                    | 0
+#                    | geo_id,
+#                    data = dta_gdp, 
+#                    cmethod = "reghdfe", 
+#                    na.action = "na.omit", 
+#                    weights = dta_gdp$population)
+# coef_gdp_h <- felmCoeff(felm = reg_bin_tem_gdp_h, var = "cuttem", breaks = 5, omit = c(20,25))
+# 
+# p.coef_gdp_h <- binned_plot(main.df = coef_gdp_h, dsty.df = tmax,
+#                               ylabel = "Sentiment change (% of SD)",
+#                               xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+#                               theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+#                               label = "", quantile.plot = F,
+#                               density.theme.color = "#2E9FDF")
+# plot(p.coef_gdp_h)
+# 
+# 
+# ## Low GDP:
+# dta_gdp <- filter(fddf.main, gdp_hi == FALSE)
+# reg_bin_tem_gdp_l <- felm(ind_score_stdz ~ cuttem +
+#                       pr + pr_2 + pm25 + pm25_2 + trange + win_s + cldtot + rhu 
+#                    | geo_id + date
+#                    | 0
+#                    | geo_id,
+#                    data = dta_gdp, 
+#                    cmethod = "reghdfe", 
+#                    na.action = "na.omit", 
+#                    weights = dta_gdp$population)
+# coef_gdp_l <- felmCoeff(felm = reg_bin_tem_gdp_l, var = "cuttem", breaks = 5, omit = c(20,25))
+# 
+# p.coef_gdp_l <- binned_plot(main.df = coef_gdp_l, dsty.df = tmax,
+#                               ylabel = "Sentiment change (% of SD)",
+#                               xlabel = expression(paste("Max. Temperature (", degree, C, ")")),
+#                               theme.color = "#2E9FDF", density.theme.fill = "#2E9FDF",
+#                               label = "", quantile.plot = F,
+#                               density.theme.color = "#2E9FDF")
+# plot(p.coef_gdp_l)
+# 
+# pmain_gdp <- ggplot() +
+#   geom_hline(yintercept = 0, color="grey50", linetype = "dashed") +
+#   geom_line(data=coef_gdp_h, aes(x = xmid, y = coef * 100, color= "High GDP"),
+#             size=1.0, alpha=1.0) +
+#   geom_ribbon(data=coef_gdp_h, aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+#               alpha = 0.50, fill = "#00A087") +
+#   geom_point(data=coef_gdp_h, aes(x = xmid, y = coef * 100),
+#              colour = "#00A087", size = 3, show.legend = FALSE) +
+#   geom_line(data=coef_gdp_l, aes(x = xmid, y = coef * 100, color= "Low GDP"),
+#             size=1.0, alpha=1.0) +
+#   geom_ribbon(data=coef_gdp_l,aes(x = xmid, ymin = ci.l*100, ymax = ci.h*100),
+#               alpha = 0.50, fill = "#E64B35") +
+#   geom_point(data=coef_gdp_l, aes(x = xmid, y = coef * 100),
+#              colour = "#E64B35", size = 3, show.legend = FALSE) +
+#   scale_color_manual(
+#     name = "Admin-1 GDP:", values = c(
+#       "High GDP" = "#00A087",
+#       "Low GDP" = "#E64B35"
+#     )
+#   ) +
+#   ylab("Sentiment change (% of an SD)") +
+#   xlab(expression(paste("Max. Temperature (", degree, C, ")"))) +
+#   xlim(-5,40.5) +
+#   theme_Publication() +
+#   theme(
+#     plot.title = element_text(hjust = 0.5),
+#     legend.title = element_text(size = 12),
+#     legend.text = element_text(size = 12),
+#     legend.key.size= unit(0.6, "cm"),
+#     legend.position = c(0.58, 0.25),
+#     legend.direction = "vertical"
+#   )
+# 
+# plot(pmain_gdp)
+# ggsave(filename = "output/figures/tem_hetero_gdp.pdf",
+#        plot = pmain_gdp, width = 8, height = 6)
+# 
+# 
+# gdp <- fddf[,c("id_0", "id_1", "gdp_hi")] %>% distinct()
+# gdp <- sf::st_read("data/spatial/adm1_simplify.shp") %>%
+#   left_join(gdp, by = c("ID_0" = "id_0", "ID_1" = "id_1"))
+# 
+# gdp_map <- ggplot() +
+#   geom_sf(data = gdp, aes(fill = factor(gdp_hi)), color="grey80", lwd = 0.075, alpha=1) +
+#     scale_fill_manual(values = c("#E64B35", "#00A087"),
+#                       labels = c("Low", "High"),
+#                       name= "GDP Level") + 
+#    theme_geosf()
+# 
+# plot(gdp_map)
+# 
+# ggsave("output/figures/gdp_map.pdf", gdp_map,
+#        width = 8, height = 5, dpi = 600)
+
+```
